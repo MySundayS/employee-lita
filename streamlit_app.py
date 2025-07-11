@@ -215,13 +215,17 @@ def main():
     if uploaded_file is not None:
         credentials_dict = json.load(uploaded_file)
     else:
-        # Use default credentials if available
+        # Try to use Streamlit secrets first
         try:
-            with open("credentials.json", 'r') as f:
-                credentials_dict = json.load(f)
+            credentials_dict = dict(st.secrets["gcp_service_account"])
         except:
-            st.warning("Please upload credentials.json file in the sidebar")
-            return
+            # Use default credentials if available
+            try:
+                with open("credentials.json", 'r') as f:
+                    credentials_dict = json.load(f)
+            except:
+                st.warning("Please upload credentials.json file in the sidebar or configure secrets")
+                return
     
     # Auto refresh logic
     if st.session_state.auto_refresh:
