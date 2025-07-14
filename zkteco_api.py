@@ -10,6 +10,8 @@ import gspread
 from google.oauth2.service_account import Credentials
 from datetime import datetime
 import time
+import json
+import tempfile
 
 # === Logging Setup ===
 logging.basicConfig(
@@ -26,6 +28,14 @@ WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Attendance")
 SYNC_INTERVAL_SECONDS = int(os.getenv("SYNC_INTERVAL_SECONDS", 5 * 60))  # 5 นาที
 RETRY_ATTEMPTS = 3
 RETRY_DELAY = 10  # วินาที
+
+credentials_data = os.getenv("CREDENTIALS_JSON")
+if credentials_data:
+    with tempfile.NamedTemporaryFile(mode='w', delete=False) as temp_file:
+        temp_file.write(credentials_data)
+        CREDENTIALS_FILE = temp_file.name
+else:
+    CREDENTIALS_FILE = os.getenv("CREDENTIALS_FILE", "/path/to/credentials.json")
 
 # === ฟังก์ชันค้นหา IP อุปกรณ์ ZKTeco ===
 def find_zkteco_device(subnet=os.getenv("ZKTECO_SUBNET", "192.168.1.2"), port=4370):
