@@ -191,6 +191,26 @@ def test_device_connection():
             }
             conn.disconnect()
             return {"status": "success", "device_info": info}
+
+
+        async def background_sync_loop():
+    while True:
+        try:
+            logger.info("[⏱️ SYNC] เริ่มซิงค์อัตโนมัติ")
+            device_ip = find_zkteco_device()
+            if not device_ip:
+                logger.warning("[⚠️ SYNC] ไม่พบเครื่อง ZKTeco")
+                await asyncio.sleep(SYNC_INTERVAL_SECONDS)
+                continue
+            zk_sync = ZKTecoGoogleSheets(device_ip, DEVICE_PORT, late_threshold_hour=8, late_threshold_minute=0)
+            success = zk_sync.run_sync(CREDENTIALS_FILE, SPREADSHEET_NAME, WORKSHEET_NAME)
+            if success:
+                logger.info("[✅ SYNC] ซิงค์ข้อมูลอัตโนมัติสำเร็จ")
+            else:
+                logger.warning("[⚠️ SYNC] ซิงค์อัตโนมัติล้มเหลว")
+        except Exception as e:
+            logger.error(f"[❌ SYNC ERROR] {e}")
+            await asyncio.sleep(SYNC_INTERVAL_SECONDS)  # รอก่อนรอบถัดไปแม้มี error
         else:
             raise HTTPException(status_code=500, detail="เชื่อมต่อไม่สำเร็จ")
     except Exception as e:
