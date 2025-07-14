@@ -1,5 +1,8 @@
 fastapi
-uvicorn[standard]
+uvicorn
 gspread
 google-auth
+google-auth-oauthlib
+python-dotenv
+pyyaml
 zk==0.9.4
