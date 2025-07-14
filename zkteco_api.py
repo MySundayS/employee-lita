@@ -1,3 +1,23 @@
+import sys
+import logging
+import os
+import asyncio
+import json
+from contextlib import asynccontextmanager
+
+# ลอง import pyzk ด้วยการ debug
+try:
+    from pyzk import ZK
+    PYZK_AVAILABLE = True
+    print(f"✅ pyzk library พร้อมใช้งาน (version: {ZK.__version__})")
+except ImportError as e:
+    PYZK_AVAILABLE = False
+    print(f"❌ ไม่พบ pyzk library: {e}", file=sys.stderr)
+    for path in sys.path:
+        print(f"Python path: {path}", file=sys.stderr)
+
+# ตัวแปรสถานะและส่วนอื่น ๆ ตามเดิม
+
 # ลอง import pyzk ด้วยวิธีปลอดภัย
 try:
     from pyzk import ZK
