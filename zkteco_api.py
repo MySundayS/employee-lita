@@ -28,7 +28,7 @@ RETRY_ATTEMPTS = 3
 RETRY_DELAY = 10  # วินาที
 
 # === ฟังก์ชันค้นหา IP อุปกรณ์ ZKTeco ===
-def find_zkteco_device(subnet="192.168.1.2", port=4370):
+def find_zkteco_device(subnet=os.getenv("ZKTECO_SUBNET", "192.168.1.2"), port=4370):
     logger.info("🔍 กำลังค้นหาอุปกรณ์ ZKTeco ในเครือข่าย...")
     for ip in ipaddress.IPv4Network(subnet):
         ip = str(ip)
