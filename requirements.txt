@@ -2,4 +2,4 @@ fastapi
 uvicorn[standard]
 gspread
 google-auth
-zk
+zk==0.9.4
