@@ -1,199 +1,233 @@
-import sys
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from typing import Optional
 import logging
 import os
 import asyncio
-import json
+import ipaddress
+import traceback
 from contextlib import asynccontextmanager
-from fastapi import FastAPI, HTTPException
-from typing import Optional
-import gspread
-from oauth2client.service_account import ServiceAccountCredentials
-from datetime import datetime
 
-# ลอง import pyzk ด้วยการ debug
+# ลอง import pyzk ด้วยวิธีปลอดภัย
 try:
     from pyzk import ZK
     PYZK_AVAILABLE = True
-    print(f"✅ pyzk library พร้อมใช้งาน (version: {ZK.__version__})")
-except ImportError as e:
-    PYZK_AVAILABLE = False
-    print(f"❌ ไม่พบ pyzk library: {e}", file=sys.stderr)
-    for path in sys.path:
-        print(f"Python path: {path}", file=sys.stderr)
+    print("✅ pyzk library พร้อมใช้งาน")
+except ImportError:
+    try:
+        from zk import ZK
+        PYZK_AVAILABLE = True
+        print("✅ zk library พร้อมใช้งาน")
+    except ImportError:
+        PYZK_AVAILABLE = False
+        print("❌ ไม่พบ ZKTeco library")
 
-# ตัวแปรสถานะ
+import gspread
+from google.oauth2.service_account import Credentials
+from datetime import datetime
+import time
+
+# === ตัวแปรสถานะ ===
 sync_running = False
 last_sync_time = None
 sync_status = "Not started"
 sync_count = 0
 
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
+# === Logging Setup ===
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
 logger = logging.getLogger(__name__)
 
 # === CONFIG ===
-ZKTECO_IP = os.getenv("ZKTECO_IP", "192.168.1.2")
-if not ZKTECO_IP:
-    logger.warning("❌ ZKTECO_IP ไม่ได้ตั้งค่า - ใช้โหมด demo")
-DEVICE_IP = ZKTECO_IP
-DEVICE_PORT = int(os.getenv("ZKTECO_PORT", 4370))
+DEVICE_IP = os.getenv("ZKTECO_IP", "192.168.1.2")
+DEVICE_PORT = int(os.getenv("DEVICE_PORT", 4370))
+CREDENTIALS_FILE = os.getenv("CREDENTIALS_FILE", "credentials.json")
 SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME", "ZKTeco Attendance")
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Attendance")
-SYNC_INTERVAL_SECONDS = int(os.getenv("SYNC_INTERVAL_SECONDS", 300))
+SYNC_INTERVAL_SECONDS = int(os.getenv("SYNC_INTERVAL_SECONDS", 300))  # 5 นาที
 
-# === SETUP CREDENTIALS ===
-def setup_credentials():
-    credentials_json = os.getenv("CREDENTIALS_JSON")
-    if not credentials_json:
-        logger.error("❌ CREDENTIALS_JSON ไม่ได้ตั้งค่าใน environment")
+# === ฟังก์ชันค้นหา IP อุปกรณ์ ZKTeco ===
+def find_zkteco_device(target_ip=None, port=4370, timeout=3):
+    """ค้นหาอุปกรณ์ ZKTeco"""
+    if not PYZK_AVAILABLE:
+        logger.error("ZKTeco library ไม่พร้อมใช้งาน")
         return None
-    try:
-        credentials_dict = json.loads(credentials_json)
-        scope = ["https://spreadsheets.google.com/feeds", "https://www.googleapis.com/auth/drive"]
-        credentials = ServiceAccountCredentials.from_json_keyfile_dict(credentials_dict, scope)
-        return credentials
-    except Exception as e:
-        logger.error(f"❌ การตั้งค่า credentials ล้มเหลว: {e}")
-        return None
+        
+    # ถ้าระบุ IP ไว้แล้ว ให้ใช้ IP นั้น
+    if target_ip:
+        logger.info(f"🔍 ทดสอบการเชื่อมต่อ IP: {target_ip}")
+        try:
+            zk = ZK(target_ip, port=port, timeout=timeout)
+            conn = zk.connect()
+            if conn:
+                logger.info(f"✅ พบอุปกรณ์ ZKTeco ที่ IP: {target_ip}")
+                conn.disconnect()
+                return target_ip
+        except Exception as e:
+            logger.warning(f"ไม่สามารถเชื่อมต่อ {target_ip}: {e}")
+    
+    # ถ้าไม่ได้ระบุหรือเชื่อมต่อไม่ได้ ให้ค้นหาในเครือข่าย
+    logger.info("🔍 กำลังค้นหาอุปกรณ์ ZKTeco ในเครือข่าย...")
+    
+    # ลอง IP ที่น่าจะเป็นไปได้
+    base_ip = "192.168.1."
+    common_ips = [2, 100, 200, 1, 254, 50, 101, 102, 103]
+    
+    for last_octet in common_ips:
+        ip = f"{base_ip}{last_octet}"
+        try:
+            zk = ZK(ip, port=port, timeout=timeout)
+            conn = zk.connect()
+            if conn:
+                logger.info(f"✅ พบอุปกรณ์ ZKTeco ที่ IP: {ip}")
+                conn.disconnect()
+                return ip
+        except Exception:
+            continue
+    
+    logger.warning("❌ ไม่พบอุปกรณ์ ZKTeco ในเครือข่าย")
+    return None
 
 # === คลาสหลัก ===
 class ZKTecoGoogleSheets:
     def __init__(self, device_ip, device_port=4370):
         self.device_ip = device_ip
         self.device_port = device_port
-        self.zk_client = None
 
-    def setup_google_sheets(self, credentials, spreadsheet_name, worksheet_name):
+    def setup_google_sheets(self, credentials_file, spreadsheet_name, worksheet_name):
+        """ตั้งค่า Google Sheets"""
         try:
-            gc = gspread.authorize(credentials)
-            sh = gc.open(spreadsheet_name)
-            worksheet = sh.worksheet(worksheet_name)
-            logger.info(f"✅ เชื่อมต่อ Google Sheets: {spreadsheet_name}/{worksheet_name}")
+            creds = Credentials.from_service_account_file(credentials_file, scopes=[
+                "https://www.googleapis.com/auth/spreadsheets",
+                "https://www.googleapis.com/auth/drive"
+            ])
+            gc = gspread.authorize(creds)
+            
+            # เปิด spreadsheet
+            try:
+                sh = gc.open(spreadsheet_name)
+            except gspread.SpreadsheetNotFound:
+                sh = gc.create(spreadsheet_name)
+                logger.info(f"สร้าง spreadsheet ใหม่: {spreadsheet_name}")
+            
+            # เปิด worksheet
+            try:
+                worksheet = sh.worksheet(worksheet_name)
+            except gspread.WorksheetNotFound:
+                worksheet = sh.add_worksheet(title=worksheet_name, rows="1000", cols="20")
+                logger.info(f"สร้าง worksheet ใหม่: {worksheet_name}")
+            
+            # ตั้งค่า headers
+            headers = ["ID", "User ID", "Name", "Timestamp", "Status", "Punch", "Date", "Time", "Device IP"]
+            try:
+                existing_headers = worksheet.row_values(1)
+                if not existing_headers or existing_headers != headers:
+                    worksheet.update('A1:I1', [headers])
+                    logger.info("อัปเดท headers แล้ว")
+            except Exception as e:
+                logger.warning(f"ไม่สามารถอัปเดท headers: {e}")
+            
             return worksheet
+            
         except Exception as e:
-            logger.error(f"❌ การเชื่อมต่อ Google Sheets ล้มเหลว: {e}")
+            logger.error(f"ไม่สามารถตั้งค่า Google Sheets: {e}")
             return None
 
-    def connect_zkteco(self):
-        """เชื่อมต่อกับ ZKTeco device"""
-        if not PYZK_AVAILABLE or not self.device_ip:
-            logger.error("ไม่สามารถเชื่อมต่อ ZKTeco: pyzk ไม่พร้อมใช้งาน หรือ ZKTECO_IP ไม่ได้ตั้งค่า")
-            return False
+    def get_users_info(self, conn):
+        """ดึงข้อมูลผู้ใช้"""
         try:
-            self.zk_client = ZK(self.device_ip, port=self.device_port)
-            conn = self.zk_client.connect()
-            if conn:
-                logger.info(f"✅ เชื่อมต่อกับ ZKTeco ที่ {self.device_ip}:{self.device_port} สำเร็จ")
-                return True
-            else:
-                logger.error(f"❌ ไม่สามารถเชื่อมต่อ ZKTeco ที่ {self.device_ip}:{self.device_port}")
-                return False
+            users = conn.get_users()
+            user_dict = {}
+            for user in users:
+                user_dict[str(user.uid)] = {
+                    'name': getattr(user, 'name', f'User_{user.uid}'),
+                    'uid': user.uid
+                }
+            logger.info(f"ดึงข้อมูลผู้ใช้ได้ {len(user_dict)} คน")
+            return user_dict
         except Exception as e:
-            logger.error(f"เกิดข้อผิดพลาดในการเชื่อมต่อ ZKTeco: {e}")
-            return False
+            logger.warning(f"ไม่สามารถดึงข้อมูลผู้ใช้: {e}")
+            return {}
 
-    def disconnect_zkteco(self):
-        """ตัดการเชื่อมต่อจาก ZKTeco device"""
-        if self.zk_client:
-            self.zk_client.disconnect()
-            logger.info("✅ ตัดการเชื่อมต่อจาก ZKTeco")
-
-    def get_zkteco_attendance(self):
-        """ดึงข้อมูล attendance จาก ZKTeco"""
-        if not self.connect_zkteco():
-            return []
-        try:
-            attendance = self.zk_client.get_attendance()
-            logger.info(f"✅ ดึงข้อมูล attendance {len(attendance)} รายการจาก ZKTeco")
-            return attendance
-        except Exception as e:
-            logger.error(f"เกิดข้อผิดพลาดในการดึง attendance: {e}")
-            return []
-        finally:
-            self.disconnect_zkteco()
-
-    def get_demo_data(self):
-        """สร้างข้อมูล demo สำหรับทดสอบ"""
-        logger.info("สร้างข้อมูล demo สำหรับทดสอบ (Cloud mode)")
-        now = datetime.now()
-        demo_data = []
-        for days_ago in range(3):
-            date = now.replace(hour=0, minute=0, second=0, microsecond=0) - datetime.timedelta(days=days_ago)
-            for user_id in ['001', '002', '003', '004', '005']:
-                checkin_time = date.replace(hour=8 + (int(user_id) % 2), minute=30 + (int(user_id) * 5) % 30)
-                demo_data.append({
-                    'user_id': user_id,
-                    'name': f'พนักงาน {user_id}',
-                    'timestamp': checkin_time,
-                    'status': 1,
-                    'punch': 1
-                })
-        return demo_data
-
-    def get_data(self):
-        """ดึงข้อมูลจาก ZKTeco หรือใช้ demo ถ้าไม่สำเร็จ"""
-        if PYZK_AVAILABLE and self.device_ip:
-            logger.info(f"🌐 โหมด Device: พยายามดึงข้อมูลจาก ZKTeco ที่ {self.device_ip}")
-            attendance = self.get_zkteco_attendance()
-            if attendance:
-                return attendance
-            else:
-                logger.warning("❌ การเชื่อมต่อ ZKTeco ล้มเหลว - ใช้ข้อมูล demo")
-        logger.info("🌐 Cloud Mode: ใช้ข้อมูล demo เนื่องจาก pyzk ไม่พร้อมใช้งานหรือ ZKTECO_IP ไม่ได้ตั้งค่า")
-        return self.get_demo_data()
-
-    def run_sync(self, credentials, spreadsheet_name, worksheet_name):
+    def run_sync(self, credentials_file, spreadsheet_name, worksheet_name):
         """ซิงค์ข้อมูลหลัก"""
         try:
-            worksheet = self.setup_google_sheets(credentials, spreadsheet_name, worksheet_name)
+            # ตั้งค่า Google Sheets
+            worksheet = self.setup_google_sheets(credentials_file, spreadsheet_name, worksheet_name)
             if not worksheet:
                 return False
 
-            attendance_data = self.get_data()
-            if not attendance_data:
-                logger.info("ไม่มีข้อมูลที่ต้องซิงค์")
+            # เชื่อมต่อ ZKTeco
+            logger.info(f"กำลังเชื่อมต่อ ZKTeco ที่ {self.device_ip}:{self.device_port}")
+            zk = ZK(self.device_ip, port=self.device_port, timeout=30)
+            conn = zk.connect()
+            if not conn:
+                raise Exception("เชื่อมต่อเครื่อง ZKTeco ไม่สำเร็จ")
+
+            logger.info("✅ เชื่อมต่อ ZKTeco สำเร็จ")
+
+            # ดึงข้อมูลผู้ใช้
+            users_info = self.get_users_info(conn)
+
+            # ดึงข้อมูลการเข้าออกงาน
+            logger.info("กำลังดึงข้อมูลการเข้าออกงาน...")
+            attendances = conn.get_attendance()
+            conn.disconnect()
+
+            if not attendances:
+                logger.info("ไม่พบข้อมูลการเข้าออกงาน")
                 return True
 
-            existing_data = worksheet.get_all_values()
-            existing_set = set()
-            for row in existing_data[1:]:  # Skip header
-                if len(row) >= 8:
-                    existing_set.add((row[1], row[6], row[7]))  # user_id, date, time
-
-            new_rows = []
-            for data in attendance_data:
-                if PYZK_AVAILABLE and hasattr(data, 'uid'):  # ตรวจสอบว่าเป็นข้อมูลจาก ZKTeco
-                    record_id = f"{data.uid}_{data.timestamp.strftime('%Y%m%d_%H%M%S')}"
-                    user_id = str(data.uid)
-                    user_name = "Unknown"  # อาจต้องดึงชื่อจาก device ถ้ามี
-                    timestamp = datetime.fromtimestamp(data.timestamp)
-                    status = 1 if data.status == "Check In" else 0
-                    punch = 1 if data.punch == "In" else 0
-                else:  # Demo data
-                    record_id = f"{data['user_id']}_{data['timestamp'].strftime('%Y%m%d_%H%M%S')}"
-                    user_id = data['user_id']
-                    user_name = data['name']
-                    timestamp = data['timestamp']
-                    status = data['status']
-                    punch = data['punch']
-
-                key = (user_id, timestamp.strftime('%Y-%m-%d'), timestamp.strftime('%H:%M:%S'))
-                if key not in existing_set:
+            # กรองข้อมูลปี 2025
+            filtered_data = []
+            for att in attendances:
+                if att.timestamp and att.timestamp >= datetime(2025, 1, 1):
+                    user_info = users_info.get(str(att.user_id), {})
+                    user_name = user_info.get('name', f'User_{att.user_id}')
+                    
                     row = [
-                        record_id,
-                        user_id,
+                        f"{att.user_id}_{att.timestamp.strftime('%Y%m%d_%H%M%S')}",  # Unique ID
+                        str(att.user_id),
                         user_name,
-                        timestamp.strftime('%Y-%m-%d %H:%M:%S'),
-                        status,
-                        punch,
-                        timestamp.strftime('%Y-%m-%d'),
-                        timestamp.strftime('%H:%M:%S'),
-                        self.device_ip + (" (Device)" if PYZK_AVAILABLE and self.device_ip else " (Cloud Demo)")
+                        att.timestamp.strftime('%Y-%m-%d %H:%M:%S'),
+                        getattr(att, 'status', 0),
+                        int(att.punch),
+                        att.timestamp.strftime('%Y-%m-%d'),
+                        att.timestamp.strftime('%H:%M:%S'),
+                        self.device_ip
                     ]
+                    filtered_data.append(row)
+
+            logger.info(f"กรองข้อมูลได้ {len(filtered_data)} รายการ (ปี 2025)")
+
+            if not filtered_data:
+                logger.info("ไม่พบข้อมูลปี 2025")
+                return True
+
+            # ตรวจสอบข้อมูลที่มีอยู่แล้ว
+            try:
+                existing_data = worksheet.get_all_values()
+                existing_set = set()
+                for row in existing_data[1:]:  # Skip header
+                    if len(row) >= 8:
+                        existing_set.add((row[1], row[6], row[7]))  # user_id, date, time
+            except Exception as e:
+                logger.warning(f"ไม่สามารถดึงข้อมูลที่มีอยู่: {e}")
+                existing_set = set()
+
+            # กรองเฉพาะข้อมูลใหม่
+            new_rows = []
+            for row in filtered_data:
+                key = (row[1], row[6], row[7])  # user_id, date, time
+                if key not in existing_set:
                     new_rows.append(row)
 
             if new_rows:
+                # เพิ่มข้อมูลใหม่
                 worksheet.append_rows(new_rows)
-                logger.info(f"✅ เพิ่มข้อมูลใหม่ {len(new_rows)} รายการ {'(Device)' if PYZK_AVAILABLE and self.device_ip else '(Cloud Demo)'}")
+                logger.info(f"✅ เพิ่มข้อมูลใหม่ {len(new_rows)} รายการ")
             else:
                 logger.info("ไม่มีข้อมูลใหม่ที่ต้องเพิ่ม")
 
@@ -201,11 +235,14 @@ class ZKTecoGoogleSheets:
 
         except Exception as e:
             logger.error(f"เกิดข้อผิดพลาดในการซิงค์: {e}")
+            logger.error(traceback.format_exc())
             return False
 
 # === BACKGROUND SYNC ===
 async def background_sync_loop():
+    """ลูปซิงค์ในพื้นหลัง"""
     global sync_running, last_sync_time, sync_status, sync_count
+    
     while True:
         try:
             if sync_running:
@@ -214,24 +251,26 @@ async def background_sync_loop():
                 
             sync_running = True
             sync_status = "Running"
-            logger.info(f"🔄 เริ่มซิงค์อัตโนมัติ {'(Device)' if PYZK_AVAILABLE and ZKTECO_IP else '(Cloud Mode)'}...")
+            logger.info("🔄 เริ่มซิงค์อัตโนมัติ...")
             
-            credentials = setup_credentials()
-            if not credentials:
-                sync_status = "Credentials error"
-                logger.error("ไม่สามารถตั้งค่า Google Sheets credentials ได้")
+            # ค้นหาอุปกรณ์
+            device_ip = find_zkteco_device(DEVICE_IP)
+            if not device_ip:
+                sync_status = "Device not found"
+                logger.warning("ไม่พบเครื่อง ZKTeco")
                 sync_running = False
                 await asyncio.sleep(SYNC_INTERVAL_SECONDS)
                 continue
 
-            zk_sync = ZKTecoGoogleSheets(DEVICE_IP, DEVICE_PORT)
-            success = zk_sync.run_sync(credentials, SPREADSHEET_NAME, WORKSHEET_NAME)
+            # ซิงค์ข้อมูล
+            zk_sync = ZKTecoGoogleSheets(device_ip, DEVICE_PORT)
+            success = zk_sync.run_sync(CREDENTIALS_FILE, SPREADSHEET_NAME, WORKSHEET_NAME)
             
             if success:
                 sync_status = "Success"
                 sync_count += 1
                 last_sync_time = datetime.now()
-                logger.info(f"✅ ซิงค์อัตโนมัติสำเร็จ {'(Device)' if PYZK_AVAILABLE and ZKTECO_IP else '(Cloud Demo)'}")
+                logger.info("✅ ซิงค์อัตโนมัติสำเร็จ")
             else:
                 sync_status = "Failed"
                 logger.warning("❌ ซิงค์อัตโนมัติล้มเหลว")
@@ -246,54 +285,63 @@ async def background_sync_loop():
 # === FastAPI Lifespan ===
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    logger.info(f"🚀 FastAPI เริ่มทำงาน {'(Device Mode)' if PYZK_AVAILABLE and ZKTECO_IP else '(Cloud Mode)'}")
-    asyncio.create_task(background_sync_loop())
-    logger.info("🔄 Background sync เริ่มทำงาน")
+    # Startup
+    logger.info("🚀 FastAPI เริ่มทำงาน")
+    if PYZK_AVAILABLE:
+        # เริ่ม background sync
+        asyncio.create_task(background_sync_loop())
+        logger.info("🔄 Background sync เริ่มทำงาน")
+    else:
+        logger.warning("⚠️ ZKTeco library ไม่พร้อมใช้งาน - ไม่สามารถทำ auto sync ได้")
+    
     yield
+    
+    # Shutdown
     logger.info("🛑 FastAPI หยุดทำงาน")
 
 # === FASTAPI APP ===
-app = FastAPI(lifespan=lifespan, title="ZKTeco Cloud API", version="1.0.0")
+app = FastAPI(lifespan=lifespan, title="ZKTeco API", version="1.0.0")
 
 # === ENDPOINT: Root ===
 @app.get("/")
 def read_root():
     return {
         "message": "ZKTeco FastAPI is running ✅",
-        "mode": "Device" if PYZK_AVAILABLE and ZKTECO_IP else "Cloud Demo",
         "pyzk_available": PYZK_AVAILABLE,
         "sync_status": sync_status,
         "sync_count": sync_count,
         "last_sync": last_sync_time.isoformat() if last_sync_time else None,
         "sync_running": sync_running,
-        "device_ip": DEVICE_IP,
-        "environment": "Cloud"
+        "device_ip": DEVICE_IP
     }
 
 # === ENDPOINT: Manual sync ===
 @app.get("/sync")
 def sync_attendance():
+    """ซิงค์ข้อมูลทันที"""
+    if not PYZK_AVAILABLE:
+        raise HTTPException(status_code=500, detail="ZKTeco library ไม่พร้อมใช้งาน")
+        
     if sync_running:
         raise HTTPException(status_code=409, detail="การซิงค์กำลังทำงานอยู่")
     
     try:
-        credentials = setup_credentials()
-        if not credentials:
-            raise HTTPException(status_code=500, detail="ไม่สามารถตั้งค่า Google Sheets credentials ได้")
+        device_ip = find_zkteco_device(DEVICE_IP)
+        if not device_ip:
+            raise HTTPException(status_code=500, detail="ไม่พบอุปกรณ์ ZKTeco")
         
-        zk_sync = ZKTecoGoogleSheets(DEVICE_IP, DEVICE_PORT)
-        success = zk_sync.run_sync(credentials, SPREADSHEET_NAME, WORKSHEET_NAME)
+        zk_sync = ZKTecoGoogleSheets(device_ip, DEVICE_PORT)
+        success = zk_sync.run_sync(CREDENTIALS_FILE, SPREADSHEET_NAME, WORKSHEET_NAME)
         
         if success:
             return {
-                "status": "success",
-                "message": f"ซิงค์ข้อมูลสำเร็จ ✅ {'(Device)' if PYZK_AVAILABLE and ZKTECO_IP else '(Cloud Demo)'}",
-                "mode": "Device" if PYZK_AVAILABLE and ZKTECO_IP else "Cloud Demo",
-                "device_ip": DEVICE_IP,
+                "status": "success", 
+                "message": "ซิงค์ข้อมูลสำเร็จ ✅",
+                "device_ip": device_ip,
                 "timestamp": datetime.now().isoformat()
             }
         else:
-            raise HTTPException(status_code500, detail="ซิงค์ไม่สำเร็จ ❌")
+            raise HTTPException(status_code=500, detail="ซิงค์ไม่สำเร็จ ❌")
             
     except HTTPException:
         raise
@@ -304,9 +352,9 @@ def sync_attendance():
 # === ENDPOINT: Status ===
 @app.get("/status")
 def get_status():
+    """ตรวจสอบสถานะระบบ"""
     return {
         "status": "running",
-        "mode": "Device" if PYZK_AVAILABLE and ZKTECO_IP else "Cloud Demo",
         "pyzk_available": PYZK_AVAILABLE,
         "sync_status": sync_status,
         "sync_count": sync_count,
@@ -314,43 +362,75 @@ def get_status():
         "last_sync": last_sync_time.isoformat() if last_sync_time else None,
         "device_ip": DEVICE_IP,
         "sync_interval": SYNC_INTERVAL_SECONDS,
-        "timestamp": datetime.now().isoformat(),
-        "environment": "Cloud"
+        "timestamp": datetime.now().isoformat()
     }
 
-# === ENDPOINT: Test ZKTeco ===
-@app.get("/test/zkteco")
-def test_zkteco():
-    """ทดสอบการเชื่อมต่อกับ ZKTeco device"""
-    if not PYZK_AVAILABLE or not ZKTECO_IP:
-        return {"detail": "pyzk library ไม่พร้อมใช้งาน หรือ ZKTECO_IP ไม่ได้ตั้งค่า - ใช้โหมด demo"}
-    
-    zk_sync = ZKTecoGoogleSheets(ZKTECO_IP, DEVICE_PORT)
-    if zk_sync.connect_zkteco():
-        attendance = zk_sync.get_zkteco_attendance()
-        zk_sync.disconnect_zkteco()
-        return {
-            "status": "success ✅",
-            "device_ip": ZKTECO_IP,
-            "connection_status": "Connected to ZKTeco device ✅",
-            "records": len(attendance),
-            "sample_data": attendance[:5] if attendance else [],
-            "mode": "Device"
-        }
-    else:
-        return {"detail": "ไม่สามารถเชื่อมต่อ ZKTeco device ได้"}
+# === ENDPOINT: Test device connection ===
+@app.get("/test/device")
+def test_device_connection():
+    """ทดสอบการเชื่อมต่อกับอุปกรณ์"""
+    if not PYZK_AVAILABLE:
+        raise HTTPException(status_code=500, detail="ZKTeco library ไม่พร้อมใช้งาน")
+        
+    device_ip = find_zkteco_device(DEVICE_IP)
+    if not device_ip:
+        raise HTTPException(status_code=500, detail="ไม่พบอุปกรณ์ ZKTeco")
+
+    try:
+        zk = ZK(device_ip, port=DEVICE_PORT, timeout=30)
+        conn = zk.connect()
+        if conn:
+            try:
+                info = {
+                    "device_ip": device_ip,
+                    "device_name": getattr(conn, 'get_device_name', lambda: 'Unknown')(),
+                    "firmware": getattr(conn, 'get_firmware_version', lambda: 'Unknown')(),
+                    "platform": getattr(conn, 'get_platform', lambda: 'Unknown')(),
+                    "connection_status": "Connected ✅"
+                }
+                
+                # ลองดึงข้อมูลผู้ใช้และการเข้าออก
+                try:
+                    users = conn.get_users()
+                    info["users_count"] = len(users) if users else 0
+                except:
+                    info["users_count"] = "Unable to fetch"
+                
+                try:
+                    attendances = conn.get_attendance()
+                    info["attendance_count"] = len(attendances) if attendances else 0
+                except:
+                    info["attendance_count"] = "Unable to fetch"
+                
+                conn.disconnect()
+                return {"status": "success", "device_info": info}
+                
+            except Exception as e:
+                conn.disconnect()
+                raise HTTPException(status_code=500, detail=f"ไม่สามารถดึงข้อมูลอุปกรณ์: {str(e)}")
+        else:
+            raise HTTPException(status_code=500, detail="เชื่อมต่อไม่สำเร็จ")
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"เกิดข้อผิดพลาด: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 # === ENDPOINT: Test Google Sheets ===
 @app.get("/test/sheets")
 def test_sheets_connection():
+    """ทดสอบการเชื่อมต่อกับ Google Sheets"""
     try:
-        credentials = setup_credentials()
-        if not credentials:
-            raise HTTPException(status_code=500, detail="ไม่สามารถตั้งค่า credentials ได้")
-        
-        gc = gspread.authorize(credentials)
+        creds = Credentials.from_service_account_file(CREDENTIALS_FILE, scopes=[
+            "https://www.googleapis.com/auth/spreadsheets",
+            "https://www.googleapis.com/auth/drive"
+        ])
+        gc = gspread.authorize(creds)
         sh = gc.open(SPREADSHEET_NAME)
         worksheet = sh.worksheet(WORKSHEET_NAME)
+        
+        # ดึงข้อมูลจำนวนแถว
         all_records = worksheet.get_all_values()
         
         return {
@@ -359,8 +439,7 @@ def test_sheets_connection():
             "worksheet_name": WORKSHEET_NAME,
             "total_rows": len(all_records),
             "headers": all_records[0] if all_records else [],
-            "connection_status": "Connected to Google Sheets ✅",
-            "mode": "Device" if PYZK_AVAILABLE and ZKTECO_IP else "Cloud"
+            "connection_status": "Connected to Google Sheets ✅"
         }
         
     except Exception as e:
@@ -370,13 +449,24 @@ def test_sheets_connection():
 # === Health Check ===
 @app.get("/health")
 def health_check():
+    """Health check endpoint"""
     return {
-        "status": "healthy",
+        "status": "healthy", 
         "timestamp": datetime.now().isoformat(),
-        "mode": "Device" if PYZK_AVAILABLE and ZKTECO_IP else "Cloud Demo"
+        "pyzk_available": PYZK_AVAILABLE
     }
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.getenv("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    print("🚀 Starting ZKTeco FastAPI server...")
+    uvicorn.run(app, host="0.0.0.0", port=8000)
+
+    # ใน zkteco_fastapi.py เพิ่มส่วนนี้
+CREDENTIALS_JSON = os.getenv("CREDENTIALS_JSON")
+if CREDENTIALS_JSON:
+    import tempfile
+    import json
+    # สร้างไฟล์ temp สำหรับ credentials
+    with tempfile.NamedTemporaryFile(mode='w', suffix='.json', delete=False) as f:
+        f.write(CREDENTIALS_JSON)
+        CREDENTIALS_FILE = f.name
