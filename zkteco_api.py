@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 
 # === Config ===
 DEVICE_PORT = int(os.getenv("DEVICE_PORT", 4370))
-CREDENTIALS_FILE = os.getenv("CREDENTIALS_FILE", "credentials.json")
+CREDENTIALS_FILE = os.getenv("CREDENTIALS_FILE", "/path/to/credentials.json")
 SPREADSHEET_NAME = os.getenv("SPREADSHEET_NAME", "ZKTeco Attendance")
 WORKSHEET_NAME = os.getenv("WORKSHEET_NAME", "Attendance")
 SYNC_INTERVAL_SECONDS = int(os.getenv("SYNC_INTERVAL_SECONDS", 5 * 60))  # 5 นาที
@@ -88,7 +88,7 @@ class ZKTecoGoogleSheets:
                 existing_data = worksheet.get_all_values()
                 existing_set = set((r[1], r[6], r[7]) for r in existing_data[1:])
 
-                new_rows = [row for row in data if (row[1], row[6], row[7]) not in existing_set]
+                new_rows = [row for row in data if (row[1], r[6], r[7]) not in existing_set]
                 if new_rows:
                     worksheet.append_rows(new_rows)
                     logger.info(f"✅ เพิ่ม {len(new_rows)} รายการใหม่ลง Google Sheets")
@@ -191,26 +191,6 @@ def test_device_connection():
             }
             conn.disconnect()
             return {"status": "success", "device_info": info}
-
-
-        async def background_sync_loop():
-    while True:
-        try:
-            logger.info("[⏱️ SYNC] เริ่มซิงค์อัตโนมัติ")
-            device_ip = find_zkteco_device()
-            if not device_ip:
-                logger.warning("[⚠️ SYNC] ไม่พบเครื่อง ZKTeco")
-                await asyncio.sleep(SYNC_INTERVAL_SECONDS)
-                continue
-            zk_sync = ZKTecoGoogleSheets(device_ip, DEVICE_PORT, late_threshold_hour=8, late_threshold_minute=0)
-            success = zk_sync.run_sync(CREDENTIALS_FILE, SPREADSHEET_NAME, WORKSHEET_NAME)
-            if success:
-                logger.info("[✅ SYNC] ซิงค์ข้อมูลอัตโนมัติสำเร็จ")
-            else:
-                logger.warning("[⚠️ SYNC] ซิงค์อัตโนมัติล้มเหลว")
-        except Exception as e:
-            logger.error(f"[❌ SYNC ERROR] {e}")
-            await asyncio.sleep(SYNC_INTERVAL_SECONDS)  # รอก่อนรอบถัดไปแม้มี error
         else:
             raise HTTPException(status_code=500, detail="เชื่อมต่อไม่สำเร็จ")
     except Exception as e:
