@@ -14,6 +14,7 @@ try:
 except ImportError:
     try:
         from zk import ZK
+        zk = ZK(os.getenv("ZKTECO_IP"), port=int(os.getenv("ZKTECO_PORT", 4370)))
         PYZK_AVAILABLE = True
         print("✅ zk library พร้อมใช้งาน")
     except ImportError:
