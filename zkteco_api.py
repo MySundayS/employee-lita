@@ -1,11 +1,9 @@
 from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
 from typing import Optional
 import logging
 import os
 import asyncio
 import json
-import tempfile
 from contextlib import asynccontextmanager
 
 # ลอง import pyzk ด้วยวิธีปลอดภัย
